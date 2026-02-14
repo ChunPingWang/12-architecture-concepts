@@ -921,8 +921,8 @@ flowchart TB
         direction TB
         C1["Client"] -->|"service-b"| VIP["🎯 Virtual IP<br/>10.96.100.1"]
         VIP -->|"kube-proxy<br/>負載平衡"| P1A["Pod 1"]
-        VIP -->|""| P1B["Pod 2"]
-        VIP -->|""| P1C["Pod 3"]
+        VIP --> P1B["Pod 2"]
+        VIP --> P1C["Pod 3"]
     end
 
     subgraph Headless["Headless Service (clusterIP: None)"]
@@ -997,8 +997,8 @@ flowchart TB
     end
 
     DB1 -.->|"水平切分"| S1
-    DB1 -.->|""| S2
-    DB1 -.->|""| S3
+    DB1 -.-> S2
+    DB1 -.-> S3
 
     style DB1 fill:#ffcdd2
     style S1 fill:#c8e6c9
