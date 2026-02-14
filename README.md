@@ -852,12 +852,396 @@ sequenceDiagram
 
 #### 四種實作版本比較
 
-| 版本 | 語言 | 函式庫 | 適用場景 | 學習重點 |
-|------|------|--------|---------|---------|
-| 7a | Python | 自製 | 學習原理 | 狀態機實作 |
-| 7b | Java | Resilience4j | Spring Boot 生產環境 | 註解驅動 |
-| 7c | Java | Spring Cloud CB | 多雲環境 | 抽象層設計 |
-| 7d | .NET | Polly v8 | .NET 生產環境 | Pipeline 模式 |
+##### 總覽比較表
+
+| 特性 | 7a Python 手動實作 | 7b Java Resilience4j | 7c Spring Cloud CB | 7d .NET Polly v8 |
+|------|-------------------|---------------------|-------------------|-----------------|
+| **語言/框架** | Python 3.11 | Java 17 / Spring Boot 3 | Java 17 / Spring Boot 4 | .NET 8 / Minimal API |
+| **函式庫** | 自製狀態機 | Resilience4j 2.2 | Spring Cloud CB + Resilience4j | Polly v8 + Microsoft.Extensions.Http.Resilience |
+| **配置方式** | 程式碼參數 | YAML + 註解 | YAML + Factory | Fluent Builder + DI |
+| **狀態管理** | 手動計數 (failure_count) | 滑動視窗 (COUNT/TIME_BASED) | 滑動視窗 (透過抽象層) | 取樣期間 (SamplingDuration) |
+| **Fallback 策略** | if/else 判斷 | `@CircuitBreaker(fallbackMethod)` | Lambda 函式 `cb.run(() -> ..., fallback)` | try/catch 模式 |
+| **監控/指標** | Console 日誌 | Actuator + 事件發布 | Actuator + 自訂 Dashboard | 自訂 Tracker + OpenTelemetry |
+| **非 HTTP 支援** | 原生支援 | 需手動包裝 | 透過 Factory 支援 | 原生支援 (Generic Pipeline) |
+| **重試整合** | 無 | 獨立 `@Retry` | YAML 配置 | Pipeline 內建 |
+| **健康檢查** | 無 | Health Indicator | Health Indicator | HealthChecks |
+| **生產就緒度** | 僅供學習 | 生產等級 | 生產等級 | 生產等級 |
+| **適用場景** | 學習原理 | Spring Boot 生產環境 | 多雲/可抽換環境 | .NET 生產環境 |
+
+##### 架構演進路線
+
+```mermaid
+flowchart LR
+    A["7a Python 手動實作\n自製狀態機"] -->|加入框架| B["7b Resilience4j\n註解驅動"]
+    B -->|加入抽象層| C["7c Spring Cloud CB\n可抽換實作"]
+    B -->|跨語言生態| D["7d .NET Polly v8\nPipeline 模式"]
+
+    style A fill:#f9f,stroke:#333
+    style B fill:#bbf,stroke:#333
+    style C fill:#bfb,stroke:#333
+    style D fill:#fbf,stroke:#333
+```
+
+---
+
+##### 版本 7a：Python 手動實作
+
+**核心概念**：從零實作斷路器狀態機，透過 `threading.Lock` 保證執行緒安全，手動管理 CLOSED → OPEN → HALF_OPEN 三態轉換。最適合用來理解斷路器的底層運作原理。
+
+```mermaid
+stateDiagram-v2
+    [*] --> CLOSED
+    CLOSED --> OPEN : failure_count >= threshold
+    OPEN --> HALF_OPEN : 超過 recovery_timeout
+    HALF_OPEN --> CLOSED : success_count >= half_open_max
+    HALF_OPEN --> OPEN : 任一請求失敗
+
+    CLOSED : 正常轉發所有請求
+    CLOSED : 失敗時遞增 failure_count
+    OPEN : 直接拒絕所有請求
+    OPEN : 回傳 Fallback 回應
+    HALF_OPEN : 允許有限的試探請求
+    HALF_OPEN : 成功則遞增 success_count
+```
+
+**關鍵配置**
+
+```python
+cb = CircuitBreaker(
+    failure_threshold=3,      # 連續失敗 3 次觸發 OPEN
+    recovery_timeout=15,      # 15 秒後嘗試 HALF_OPEN
+    half_open_max=2           # 2 次成功恢復 CLOSED
+)
+
+def call(self, func):
+    with self.lock:
+        if self.state == self.OPEN:
+            if time.time() - self.last_failure_time > self.recovery_timeout:
+                self.state = self.HALF_OPEN
+                self.success_count = 0
+            else:
+                return None, "Circuit is OPEN - request rejected"
+    try:
+        result = func()
+        with self.lock:
+            if self.state == self.HALF_OPEN:
+                self.success_count += 1
+                if self.success_count >= self.half_open_max:
+                    self.state = self.CLOSED
+                    self.failure_count = 0
+        return result, None
+    except Exception as e:
+        with self.lock:
+            self.failure_count += 1
+            self.last_failure_time = time.time()
+            if self.failure_count >= self.failure_threshold:
+                self.state = self.OPEN
+        return None, str(e)
+```
+
+**優點**
+- 零依賴，完全掌握狀態轉換邏輯
+- 程式碼量少，適合教學與理解原理
+- 可任意客製化轉換條件
+
+**限制**
+- 缺乏滑動視窗、慢呼叫偵測等進階功能
+- 無內建監控指標與健康檢查
+- 不適合直接用於生產環境
+
+---
+
+##### 版本 7b：Java Resilience4j
+
+**核心概念**：使用 Resilience4j 的 `@CircuitBreaker` 註解，以宣告式方式在 Spring Boot 中啟用斷路器。透過 YAML 配置滑動視窗與失敗率閾值，搭配 Actuator 提供完整的監控指標。
+
+```mermaid
+flowchart TB
+    subgraph Spring Boot Application
+        Controller["ApiController\n/api/call"]
+        Service["DownstreamService\n@CircuitBreaker"]
+        Fallback["fallback()\n回傳預設回應"]
+    end
+
+    subgraph Resilience4j
+        CB["CircuitBreaker 實例\n滑動視窗: 5 次"]
+        Registry["CircuitBreakerRegistry"]
+        Events["事件發布器"]
+    end
+
+    subgraph 監控
+        Actuator["Actuator Endpoints\n/actuator/circuitbreakers"]
+        Health["Health Indicator"]
+    end
+
+    Controller --> Service
+    Service --> CB
+    CB -->|成功| Service
+    CB -->|失敗/OPEN| Fallback
+    Registry --> CB
+    CB --> Events
+    Events --> Actuator
+    Registry --> Health
+```
+
+**關鍵配置**
+
+```yaml
+# application.yml
+resilience4j:
+  circuitbreaker:
+    configs:
+      default:
+        slidingWindowType: COUNT_BASED
+        slidingWindowSize: 5
+        minimumNumberOfCalls: 3
+        failureRateThreshold: 50        # 失敗率 >= 50% 觸發 OPEN
+        waitDurationInOpenState: 15s
+        permittedNumberOfCallsInHalfOpenState: 2
+        automaticTransitionFromOpenToHalfOpenEnabled: true
+```
+
+```java
+@CircuitBreaker(name = "downstreamService", fallbackMethod = "fallback")
+public String callDownstream() {
+    return restTemplate.getForObject("http://flaky-service/", String.class);
+}
+
+public String fallback(Exception ex) {
+    return "{\"source\":\"FALLBACK\",\"message\":\"斷路器已啟動\"}";
+}
+```
+
+**優點**
+- 註解驅動，一行即可啟用斷路器
+- 滑動視窗支援 COUNT_BASED 與 TIME_BASED
+- 內建 Actuator 監控、Health Indicator、事件發布
+- 可透過 YAML 熱更新配置
+
+**限制**
+- 僅限 Spring Boot 生態系
+- 註解模式下 Fallback 方法簽名需匹配原方法
+- 非 HTTP 場景需額外包裝
+
+---
+
+##### 版本 7c：Spring Cloud Circuit Breaker
+
+**核心概念**：使用 Spring Cloud 提供的 `CircuitBreakerFactory` 抽象層，將斷路器實作與業務程式碼解耦。底層可抽換為 Resilience4j、Sentinel 等不同實作，並支援多組態 profile（shared/strict）區分不同服務等級。
+
+```mermaid
+flowchart TB
+    subgraph Application Layer
+        Controller["ApiController"]
+        Service["DownstreamService"]
+    end
+
+    subgraph Spring Cloud 抽象層
+        Factory["CircuitBreakerFactory\n.create(name)"]
+        CBInterface["CircuitBreaker 介面\n.run(supplier, fallback)"]
+    end
+
+    subgraph 底層實作 - 可抽換
+        R4J["Resilience4j"]
+        Sentinel["Sentinel"]
+        Other["其他實作..."]
+    end
+
+    subgraph 配置
+        Shared["shared profile\n標準服務"]
+        Strict["strict profile\n關鍵服務"]
+    end
+
+    Controller --> Service
+    Service --> Factory
+    Factory --> CBInterface
+    CBInterface --> R4J
+    CBInterface -.-> Sentinel
+    CBInterface -.-> Other
+    Shared --> R4J
+    Strict --> R4J
+```
+
+**關鍵配置**
+
+```yaml
+# 多組態 profile
+resilience4j:
+  circuitbreaker:
+    configs:
+      shared:                           # 一般服務
+        slidingWindowSize: 5
+        failureRateThreshold: 50
+        waitDurationInOpenState: 15s
+      strict:                           # 關鍵服務（更嚴格）
+        slidingWindowSize: 3
+        failureRateThreshold: 40
+        waitDurationInOpenState: 30s
+    instances:
+      downstreamService:
+        baseConfig: shared
+      criticalService:
+        baseConfig: strict
+```
+
+```java
+// 透過 Factory 建立斷路器，搭配 Lambda Fallback
+public String callWithSpringCloudCB() {
+    var cb = circuitBreakerFactory.create("downstreamService");
+    return cb.run(
+        () -> restClient.get().uri("/").retrieve().body(String.class),
+        throwable -> "{\"source\":\"FALLBACK\",\"error\":\"" + throwable.getMessage() + "\"}"
+    );
+}
+
+// 事件監聽器 — 記錄狀態轉換
+@PostConstruct
+public void registerEventListeners() {
+    circuitBreakerRegistry.getAllCircuitBreakers().forEach(cb ->
+        cb.getEventPublisher()
+            .onStateTransition(event -> log.warn("CB [{}] 狀態轉換: {} → {}",
+                event.getCircuitBreakerName(),
+                event.getStateTransition().getFromState(),
+                event.getStateTransition().getToState()))
+    );
+}
+```
+
+**優點**
+- 抽象層設計，可在不改動業務程式碼的情況下更換底層實作
+- 多組態 profile 適用於不同服務等級
+- Lambda 風格 Fallback，程式碼簡潔
+- 完整的事件監聽與 Dashboard 支援
+
+**限制**
+- 額外的抽象層增加理解成本
+- 需引入 Spring Cloud 依賴
+- 部分 Resilience4j 進階功能無法透過抽象層直接使用
+
+---
+
+##### 版本 7d：.NET Polly v8
+
+**核心概念**：使用 Polly v8 搭配 `Microsoft.Extensions.Http.Resilience`，提供三種 Pipeline 模式：Standard（一行設定）、Custom（細粒度控制）、Generic（非 HTTP 場景）。原生整合 DI 容器與 OpenTelemetry。
+
+```mermaid
+flowchart TB
+    subgraph ASP.NET Minimal API
+        Endpoints["API Endpoints\n/api/standard\n/api/custom\n/api/generic"]
+        Service["DownstreamService"]
+        Tracker["CircuitBreakerTracker\n統計追蹤"]
+    end
+
+    subgraph Polly v8 Pipelines
+        Standard["Standard Pipeline\nAddStandardResilienceHandler\nCB + Retry + Timeout 一站式"]
+        Custom["Custom Pipeline\nAddResilienceHandler\n自訂事件回呼"]
+        Generic["Generic Pipeline\nAddResiliencePipeline\n非 HTTP 支援"]
+    end
+
+    subgraph 整合
+        DI["DI 容器\nIHttpClientFactory"]
+        OTel["OpenTelemetry\nMetering API"]
+    end
+
+    Endpoints --> Service
+    Service --> Standard
+    Service --> Custom
+    Service --> Generic
+    Standard --> DI
+    Custom --> DI
+    Generic --> DI
+    Standard --> OTel
+    Custom --> OTel
+    Generic --> OTel
+    Service --> Tracker
+```
+
+**關鍵配置**
+
+```csharp
+// 模式 1：Standard — 一行啟用完整韌性策略（推薦）
+builder.Services
+    .AddHttpClient("DownstreamStandard", client =>
+        client.BaseAddress = new Uri("http://flaky-service/"))
+    .AddStandardResilienceHandler(options =>
+    {
+        options.CircuitBreaker.FailureRatio = 0.5;
+        options.CircuitBreaker.MinimumThroughput = 3;
+        options.CircuitBreaker.BreakDuration = TimeSpan.FromSeconds(15);
+        options.Retry.MaxRetryAttempts = 2;
+        options.Retry.BackoffType = DelayBackoffType.Exponential;
+    });
+
+// 模式 2：Custom — 自訂事件回呼
+builder.Services
+    .AddHttpClient("DownstreamCustom", client =>
+        client.BaseAddress = new Uri("http://flaky-service/"))
+    .AddResilienceHandler("custom-pipeline", pipelineBuilder =>
+    {
+        pipelineBuilder.AddCircuitBreaker(new HttpCircuitBreakerStrategyOptions
+        {
+            FailureRatio = 0.4,
+            MinimumThroughput = 2,
+            BreakDuration = TimeSpan.FromSeconds(30),
+            OnOpened = args => { Console.WriteLine("OPENED!"); return ValueTask.CompletedTask; },
+            OnClosed = args => { Console.WriteLine("CLOSED"); return ValueTask.CompletedTask; },
+        });
+    });
+
+// 模式 3：Generic — 非 HTTP 場景（DB、gRPC、MQ）
+builder.Services.AddResiliencePipeline("generic-pipeline", pipelineBuilder =>
+{
+    pipelineBuilder
+        .AddCircuitBreaker(new CircuitBreakerStrategyOptions
+        {
+            FailureRatio = 0.5,
+            MinimumThroughput = 3,
+            BreakDuration = TimeSpan.FromSeconds(15),
+            ShouldHandle = new PredicateBuilder().Handle<Exception>(),
+        })
+        .AddTimeout(TimeSpan.FromSeconds(2))
+        .AddRetry(new RetryStrategyOptions
+        {
+            MaxRetryAttempts = 2,
+            BackoffType = DelayBackoffType.Exponential,
+        });
+});
+```
+
+**優點**
+- 三種模式適用不同場景，彈性極高
+- Fluent Builder API，可讀性佳
+- 原生 DI 整合（IHttpClientFactory）
+- OpenTelemetry 內建支援
+- Generic Pipeline 可應用於 DB、gRPC、MQ 等非 HTTP 場景
+
+**限制**
+- Polly v8 與 v7 API 不相容，升級需重構
+- 事件回呼為非同步模式（ValueTask），學習曲線稍高
+- 生態系相較 Resilience4j 文件資源較少
+
+---
+
+##### 選擇指南
+
+```mermaid
+flowchart TD
+    Start["選擇斷路器實作方案"] --> Q1{"目標是什麼？"}
+
+    Q1 -->|學習原理| A["7a Python 手動實作\n理解狀態機運作"]
+    Q1 -->|生產環境| Q2{"使用什麼語言/框架？"}
+
+    Q2 -->|Java / Spring Boot| Q3{"需要可抽換實作嗎？"}
+    Q2 -->|.NET| D["7d Polly v8\n選擇適合的 Pipeline 模式"]
+
+    Q3 -->|單一實作即可| B["7b Resilience4j\n註解驅動 + Actuator"]
+    Q3 -->|需要抽象層| C["7c Spring Cloud CB\n多組態 + 可抽換底層"]
+
+    style A fill:#f9f,stroke:#333
+    style B fill:#bbf,stroke:#333
+    style C fill:#bfb,stroke:#333
+    style D fill:#fbf,stroke:#333
+```
 
 #### 執行 PoC
 
