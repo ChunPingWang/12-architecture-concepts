@@ -1288,7 +1288,7 @@ flowchart LR
 
     subgraph discovery["✅ 服務發現"]
         direction LR
-        A2["Service A"] -->|'service-b'"| DNS["🔍 DNS"]
+        A2["Service A"] -->|"service-b"| DNS["🔍 DNS"]
         DNS -->|"解析"| IPS["10.0.0.5<br/>10.0.0.6<br/>10.0.0.7"]
         IPS --> B2["Service B<br/>(任一實例)"]
     end
