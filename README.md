@@ -850,6 +850,9 @@ sequenceDiagram
     Note over CB: 試探成功！狀態: CLOSED 🟢
 ```
 
+> **完整獨立專案**：四種斷路器實作已提取為獨立的 GitHub Repo，包含完整的專案結構、Dockerfile 與 K8s manifests：
+> 👉 [ChunPingWang/circuit-breaker-pattern](https://github.com/ChunPingWang/circuit-breaker-pattern)
+
 #### 四種實作版本比較
 
 ##### 總覽比較表
